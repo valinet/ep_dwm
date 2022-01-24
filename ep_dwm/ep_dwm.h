@@ -8,20 +8,11 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #include <dpa_dsa.h>
 #include <Psapi.h>
 #pragma comment(lib, "Comctl32.lib")
+#include <tchar.h>
 
-#ifndef EP_DWM_NO_EXPORTS
-__declspec(dllexport) 
-#endif
 void WINAPI ep_dwm_ServiceMain(DWORD argc, LPTSTR* argv);
-#ifndef EP_DWM_NO_EXPORTS
-__declspec(dllexport)
-#endif
 BOOL ep_dwm_StartService(LPWSTR wszServiceName, LPWSTR wszEventName);
-#ifndef EP_DWM_NO_EXPORTS
-__declspec(dllexport)
-#endif
-int ep_dwm_StartService2(HWND hWnd, HINSTANCE hInstance, LPSTR lpszCmdLine, int nCmdShow);
-inline void* ep_memmem(void* haystack, size_t haystacklen, void* needle, size_t needlelen)
+inline void* ep_dwm_memmem(void* haystack, size_t haystacklen, void* needle, size_t needlelen)
 {
     const char* text = (const char*)haystack;
     const char* pattern = (const char*)needle;

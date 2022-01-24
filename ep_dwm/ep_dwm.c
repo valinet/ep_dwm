@@ -80,7 +80,7 @@ static DWORD ep_dwm_DeterminePatchAddresses(WCHAR* wszUDWMPath, HDPA dpaOffsetLi
 					char* pCandidate = NULL;
 					while (TRUE)
 					{
-						pCandidate = ep_memmem(
+						pCandidate = ep_dwm_memmem(
 							!pCandidate ? hModule + section->VirtualAddress : pCandidate,
 							!pCandidate ? section->SizeOfRawData : (uintptr_t)section->SizeOfRawData - (uintptr_t)(pCandidate - (hModule + section->VirtualAddress)),
 							ep_dwm_pattern_data[0],
@@ -503,26 +503,22 @@ BOOL WINAPI ep_dwm_StartService(LPWSTR wszServiceName, LPWSTR wszEventName)
 	return StartServiceCtrlDispatcherW(ServiceTable);
 }
 
-int ep_dwm_StartService2(HWND hWnd, HINSTANCE hInstance, LPSTR lpszCmdLine, int nCmdShow)
+#ifndef EP_DWM_NO_WINMAIN
+int WINAPI wWinMain(
+	_In_ HINSTANCE hInstance,
+	_In_opt_ HINSTANCE hPrevInstance,
+	_In_ LPWSTR lpCmdLine,
+	_In_ int nShowCmd
+)
 {
-	ep_dwm_StartService(L"ep_dwm_Service_{957A01C5-676F-4958-8F64-829FCF4C82DA}", L"Global\\ep_dwm_Service_{957A01C5-676F-4958-8F64-829FCF4C82DA}");
-}
-
-#ifndef EP_DWM_NO_DLLMAIN
-BOOL WINAPI DllMain(_In_ HINSTANCE hinstDLL, _In_ DWORD fdwReason, _In_ LPVOID lpvReserved)
-{
-	switch (fdwReason)
+	int argc = 0;
+	LPWSTR* wargv = CommandLineToArgvW(lpCmdLine, &argc);
+	ZeroMemory(lpCmdLine, sizeof(WCHAR) * wcslen(lpCmdLine));
+	if (argc >= 2)
 	{
-	case DLL_PROCESS_ATTACH:
-		DisableThreadLibraryCalls(hinstDLL);
-		break;
-	case DLL_THREAD_ATTACH:
-		break;
-	case DLL_THREAD_DETACH:
-		break;
-	case DLL_PROCESS_DETACH:
-		break;
+		ep_dwm_StartService(wargv[0], wargv[1]);
+		LocalFree(wargv);
 	}
-	return TRUE;
+	return 0;
 }
 #endif
