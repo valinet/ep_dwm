@@ -150,7 +150,6 @@
     <ClCompile Include="ep_dwm.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\ExplorerPatcher\utility.h" />
     <ClInclude Include="ep_dwm.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

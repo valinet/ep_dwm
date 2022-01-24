@@ -23,8 +23,5 @@
     <ClInclude Include="ep_dwm.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\ExplorerPatcher\utility.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
   </ItemGroup>
 </Project>
