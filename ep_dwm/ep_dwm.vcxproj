@@ -151,6 +151,10 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ep_dwm.h" />
+    <ClInclude Include="resource.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="ep_dwm.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
