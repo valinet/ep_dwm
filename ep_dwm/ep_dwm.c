@@ -7,20 +7,14 @@ SERVICE_STATUS_HANDLE ep_dwm_g_StatusHandle = NULL;
 HANDLE                ep_dwm_g_Service = INVALID_HANDLE_VALUE;
 HANDLE                ep_dwm_g_ServiceStopEvent = INVALID_HANDLE_VALUE;
 HANDLE                ep_dwm_g_ServiceSessionChangeEvent = INVALID_HANDLE_VALUE;
-DWORD				  ep_dwm_g_ExitCode = 0;
 #define				  EP_DWM_NUM_EVENTS 2
 #define               EP_DWM_SETUP_TIME 2000
 #define               EP_DWM_GRACE_TIME 5000
 #define				  EP_DWM_GROW 10
 #define               EP_DWM_MAX_NUM_MODULES 200
-#define               EP_DWM_PATCH_ERROR_MASK 0x2710
-#define				  EP_DWM_PATCH_ERROR_SUCCESS 0
-#define				  EP_DWM_PATCH_ERROR_NO_MODULES 1
-#define               EP_DWM_PATCH_ERROR_CANNOT_CHANGE_MEMORY_PROTECTION 2
-#define               EP_DWM_PATCH_ERROR_UNSUITABLE_PATCH 3
-#define				  EP_DWM_PATCH_ERROR_REMOTE_WRITE_FAILED 4
-#define               EP_DWM_PATCH_ERROR_NO_UDWM 5
-#define               EP_DWM_PATCH_ERROR_NO_MEMORY 6
+#define               EP_DWM_REASON_NONE 0
+#define               EP_DWM_REASON_TERMINATION_BYUSER 1
+#define               EP_DWM_REASON_EARLIER_ERROR 2
 char ep_dwm_pattern_data[1][6] = { {0x0F, 0x57, 0xF6, 0xF3, 0x48, 0x0F} };
 // xorps xmm6, xmm6
 // cvtsi2ss xmm6, rax
@@ -30,6 +24,54 @@ char ep_dwm_patch_data[1][4] = { {0x31, 0xC0, 0xFF, 0xC0} };
 // xor eax, eax
 // inc eax
 unsigned int ep_dwm_patch_length[1] = { 4 };
+
+#define STRINGER_INTERNAL(x) #x
+#define STRINGER(x) STRINGER_INTERNAL(x)
+
+#define CLEAR(x) { \
+	DPA_DestroyCallback(dpaHandlesList, ep_dwm_DestroyHandle, dpaExclusionList); \
+	if (x == EP_DWM_REASON_TERMINATION_BYUSER) OutputDebugStringW(L"ep_dwm: Terminating as per user request (line " _T(STRINGER(__LINE__)) L").\n"); \
+	else if (x == EP_DWM_REASON_EARLIER_ERROR) OutputDebugStringW(L"ep_dwm: Terminating due to earlier failure (line " _T(STRINGER(__LINE__)) L")!\n"); \
+}
+
+#define CLEAR_AND_DEPATCH(x) { \
+	for (unsigned int i = EP_DWM_NUM_EVENTS; i < DPA_GetPtrCount(dpaHandlesList); ++i) \
+	{ \
+		ep_dwm_PatchProcess(wszUDWMPath, DPA_FastGetPtr(dpaHandlesList, i), dpaOffsetList, dpaOldCodeList); \
+	} \
+	CLEAR(x); \
+}
+
+#define REPORT_ON_PROCESS(s, i) { \
+	DWORD dwExitCode = 0; \
+	GetExitCodeProcess(DPA_FastGetPtr(dpaHandlesList, i), &dwExitCode); \
+	if (dwExitCode && dwExitCode != 0xd00002fe) \
+	{ \
+		if (s) { \
+			dwFailedNum = i; \
+			dwRes = dwExitCode; \
+		} \
+		OutputDebugStringW(L"ep_dwm: One of the processes has crashed (line " _T(STRINGER(__LINE__)) L")!\n"); \
+	} \
+	else \
+	{ \
+		if (!dwRes || !s) \
+		{ \
+			if (s) { \
+				dwFailedNum = i; \
+				dwRes = 0; \
+			} \
+			if (dwExitCode == 0xd00002fe) \
+			{ \
+				OutputDebugStringW(L"ep_dwm: The Desktop Window Manager has exited with code (0xd00002fe) (line " _T(STRINGER(__LINE__)) L")!\n"); \
+			} \
+			else \
+			{ \
+				OutputDebugStringW(L"ep_dwm: An instance of the Desktop Window Manager has closed (line " _T(STRINGER(__LINE__)) L")!\n"); \
+			} \
+		} \
+	} \
+}
 
 static int ep_dwm_DestroyOldCode(void* p, void* pUnused)
 {
@@ -56,12 +98,13 @@ static int ep_dwm_DestroyHandle(HANDLE h, HDPA dpaExclusionList)
 
 static DWORD ep_dwm_DeterminePatchAddresses(WCHAR* wszUDWMPath, HDPA dpaOffsetList, HDPA dpaPatchList)
 {
-	DWORD dwRes = EP_DWM_PATCH_ERROR_SUCCESS;
+	DWORD dwRes = 0;
 
 	HMODULE hModule = LoadLibraryW(wszUDWMPath, NULL, LOAD_LIBRARY_AS_DATAFILE);
 	if (!hModule)
 	{
-		return EP_DWM_PATCH_ERROR_NO_UDWM;
+		OutputDebugStringW(L"ep_dwm: Failed (LoadLibraryW) (line " _T(STRINGER(__LINE__)) L")!\n");
+		return __LINE__;
 	}
 
 	void* p = NULL;
@@ -109,7 +152,7 @@ static DWORD ep_dwm_DeterminePatchAddresses(WCHAR* wszUDWMPath, HDPA dpaOffsetLi
 								{
 									free(DPA_FastGetPtr(dpaPatchList, k));
 								}
-								return EP_DWM_PATCH_ERROR_NO_MEMORY;
+								return __LINE__;
 							}
 							memcpy(pOldCode, pCandidate - ep_dwm_patch_length[0], ep_dwm_patch_length[0]);
 							DPA_AppendPtr(dpaPatchList, pOldCode);
@@ -127,12 +170,23 @@ static DWORD ep_dwm_DeterminePatchAddresses(WCHAR* wszUDWMPath, HDPA dpaOffsetLi
 
 	FreeLibrary(hModule);
 
+	if (DPA_GetPtrCount(dpaOffsetList) != DPA_GetPtrCount(dpaPatchList))
+	{
+		OutputDebugStringW(L"ep_dwm: Different number of offsets and places to patch!\n");
+		dwRes == __LINE__;
+	}
+	if (DPA_GetPtrCount(dpaOffsetList) == 0)
+	{
+		OutputDebugStringW(L"ep_dwm: Unable to identify patch area!\n");
+		dwRes == __LINE__;
+	}
+
 	return dwRes;
 }
 
 static DWORD ep_dwm_PatchProcess(WCHAR* wszUDWMPath, HANDLE hProcess, HDPA dpaOffsetList, HDPA dpaOldCodeList)
 {
-	DWORD dwRes = EP_DWM_PATCH_ERROR_SUCCESS;
+	DWORD dwRes = 0;
 
 	MODULEENTRY32 me32;
 	ZeroMemory(&me32, sizeof(MODULEENTRY32));
@@ -140,7 +194,8 @@ static DWORD ep_dwm_PatchProcess(WCHAR* wszUDWMPath, HANDLE hProcess, HDPA dpaOf
 	HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetProcessId(hProcess));
 	if (!hSnapshot)
 	{
-		return EP_DWM_PATCH_ERROR_NO_MODULES;
+		OutputDebugStringW(L"ep_dwm: Failed (CreateToolhelp32Snapshot TH32CS_SNAPMODULE) (line " _T(STRINGER(__LINE__)) L")!\n");
+		return __LINE__;
 	}
 	if (Module32FirstW(hSnapshot, &me32) == TRUE)
 	{
@@ -154,21 +209,23 @@ static DWORD ep_dwm_PatchProcess(WCHAR* wszUDWMPath, HANDLE hProcess, HDPA dpaOf
 					SIZE_T dwNumberOfBytesWritten = 0;
 					if (!VirtualProtectEx(hProcess, me32.modBaseAddr + (uintptr_t)DPA_FastGetPtr(dpaOffsetList, j) - ep_dwm_patch_length[0], ep_dwm_patch_length[0], PAGE_EXECUTE_READWRITE, &dwOldProtect))
 					{
-						dwRes = EP_DWM_PATCH_ERROR_CANNOT_CHANGE_MEMORY_PROTECTION;
+						OutputDebugStringW(L"ep_dwm: Failed (VirtualProtectEx) (line " _T(STRINGER(__LINE__)) L")!\n");
+						dwRes = __LINE__;
 					}
 					else
 					{
 						WriteProcessMemory(hProcess, me32.modBaseAddr + (uintptr_t)DPA_FastGetPtr(dpaOffsetList, j) - ep_dwm_patch_length[0], dpaOldCodeList ? DPA_FastGetPtr(dpaOldCodeList, j) : ep_dwm_patch_data[0], ep_dwm_patch_length[0], &dwNumberOfBytesWritten);
 						if (!dwNumberOfBytesWritten || dwNumberOfBytesWritten != ep_dwm_patch_length[0])
 						{
-							dwRes = EP_DWM_PATCH_ERROR_REMOTE_WRITE_FAILED;
+							OutputDebugStringW(L"ep_dwm: Failed (WriteProcessMemory) (line " _T(STRINGER(__LINE__)) L")!\n");
+							dwRes = __LINE__;
 						}
 						VirtualProtectEx(hProcess, me32.modBaseAddr + (uintptr_t)DPA_FastGetPtr(dpaOffsetList, j) - ep_dwm_patch_length[0], ep_dwm_patch_length[0], dwOldProtect, &dwOldProtect);
 					}
 				}
 				break;
 			}
-		} while (Module32NextW(hSnapshot, &me32) == TRUE && dwRes == EP_DWM_PATCH_ERROR_SUCCESS);
+		} while (Module32NextW(hSnapshot, &me32) == TRUE && dwRes == 0);
 	}
 	CloseHandle(hSnapshot);
 
@@ -177,6 +234,8 @@ static DWORD ep_dwm_PatchProcess(WCHAR* wszUDWMPath, HANDLE hProcess, HDPA dpaOf
 
 static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 {
+	DWORD dwRes = __LINE__;
+
 	HANDLE hSnapshot = NULL;
 	PROCESSENTRY32 pe32;
 	HDPA dpaExclusionList = NULL;
@@ -195,33 +254,43 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 	dpaOffsetList = DPA_Create(EP_DWM_GROW);
 	if (!dpaOffsetList)
 	{
-		return 0;
+		OutputDebugStringW(L"ep_dwm: Failed (DPA_Create) (line " _T(STRINGER(__LINE__)) L")!\n");
+		dwRes = __LINE__;
+		return dwRes;
 	}
 
 	dpaOldCodeList = DPA_Create(EP_DWM_GROW);
 	if (!dpaOldCodeList)
 	{
-		return 0;
+		OutputDebugStringW(L"ep_dwm: Failed (DPA_Create) (line " _T(STRINGER(__LINE__)) L")!\n");
+		dwRes = __LINE__;
+		return dwRes;
 	}
 
-	if (ep_dwm_DeterminePatchAddresses(wszUDWMPath, dpaOffsetList, dpaOldCodeList))
+	if (dwRes = ep_dwm_DeterminePatchAddresses(wszUDWMPath, dpaOffsetList, dpaOldCodeList))
 	{
-		return 0;
+		return dwRes;
 	}
 
 	dpaExclusionList = DPA_Create(EP_DWM_NUM_EVENTS);
 	if (!dpaExclusionList)
 	{
-		return 0;
+		dwRes = __LINE__;
+		OutputDebugStringW(L"ep_dwm: Failed (DPA_Create) (line " _T(STRINGER(__LINE__)) L")!\n");
+		return dwRes;
 	}
 	DPA_AppendPtr(dpaExclusionList, ep_dwm_g_ServiceStopEvent);
 	DPA_AppendPtr(dpaExclusionList, ep_dwm_g_ServiceSessionChangeEvent);
 
 	while (TRUE)
 	{
+		DWORD dwFailedNum = 0;
+
 		dpaHandlesList = DPA_Create(EP_DWM_GROW);
 		if (!dpaHandlesList)
 		{
+			dwRes = __LINE__;
+			OutputDebugStringW(L"ep_dwm: Failed (DPA_Create) (line " _T(STRINGER(__LINE__)) L")!\n");
 			break;
 		}
 
@@ -230,6 +299,7 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 			DPA_AppendPtr(dpaHandlesList, DPA_FastGetPtr(dpaExclusionList, i));
 		}
 
+		// Make list of dwm.exe processes
 		hSnapshot = NULL;
 		ZeroMemory(&pe32, sizeof(PROCESSENTRY32));
 		pe32.dwSize = sizeof(PROCESSENTRY32);
@@ -237,6 +307,8 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 		if (!hSnapshot)
 		{
 			DPA_Destroy(dpaHandlesList);
+			OutputDebugStringW(L"ep_dwm: Failed (CreateToolhelp32Snapshot TH32CS_SNAPPROCESS) (line " _T(STRINGER(__LINE__)) L")!\n");
+			dwRes = __LINE__;
 			break;
 		}
 		if (Process32FirstW(hSnapshot, &pe32) == TRUE)
@@ -257,6 +329,7 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 					);
 					if (!hProcess)
 					{
+						OutputDebugStringW(L"ep_dwm: Failed (OpenProcess) (line " _T(STRINGER(__LINE__)) L")!\n");
 						continue;
 					}
 					TCHAR wszProcessPath[MAX_PATH];
@@ -275,73 +348,111 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 		}
 		CloseHandle(hSnapshot);
 
+		// If process list is empty, retry
+		if (DPA_GetPtrCount(dpaHandlesList) == 0)
+		{
+			DPA_Destroy(dpaHandlesList);
+			OutputDebugStringW(L"ep_dwm: Desktop Window Manager is not running!\n");
+			OutputDebugStringW(L"ep_dwm: Retry (line " _T(STRINGER(__LINE__)) L").\n");
+			continue;
+		}
+
+		// Give processes a bit of time to start up
+		OutputDebugStringW(L"ep_dwm: Waiting " _T(STRINGER(EP_DWM_SETUP_TIME)) L" ms for the processes to be ready.\n");
 		if (WaitForSingleObject(ep_dwm_g_ServiceStopEvent, EP_DWM_SETUP_TIME) == WAIT_OBJECT_0)
 		{
-			DPA_DestroyCallback(dpaHandlesList, ep_dwm_DestroyHandle, dpaExclusionList);
+			CLEAR(EP_DWM_REASON_TERMINATION_BYUSER);
 			break;
 		}
 
+		// Attempt to patch each process
 		for (unsigned int i = EP_DWM_NUM_EVENTS; i < DPA_GetPtrCount(dpaHandlesList); ++i)
 		{
-			DWORD dwStatus = ep_dwm_PatchProcess(wszUDWMPath, DPA_FastGetPtr(dpaHandlesList, i), dpaOffsetList, NULL);
-			if (dwStatus != EP_DWM_PATCH_ERROR_SUCCESS)
+			if (ep_dwm_PatchProcess(wszUDWMPath, DPA_FastGetPtr(dpaHandlesList, i), dpaOffsetList, NULL))
 			{
-				ep_dwm_g_ExitCode = EP_DWM_PATCH_ERROR_MASK & dwStatus;
+				dwFailedNum = i;
+				dwRes = __LINE__;
+				break;
 			}
 		}
+		if (dwFailedNum)
+		{
+			// If patching for a process failed, reverse the patch on the previous ones and give up
+			CLEAR_AND_DEPATCH(EP_DWM_REASON_EARLIER_ERROR);
+			break;
+		}
+		OutputDebugStringW(L"ep_dwm: Patched processes.\n");
 
+		// Give patch a bit of time in order to observe if it lead to program crash
+		OutputDebugStringW(L"ep_dwm: Waiting " _T(STRINGER(EP_DWM_GRACE_TIME)) L" ms to determine if patch doesn't lead to crash.\n");
 		if (WaitForSingleObject(ep_dwm_g_ServiceStopEvent, EP_DWM_GRACE_TIME) == WAIT_OBJECT_0)
 		{
-			for (unsigned int i = EP_DWM_NUM_EVENTS; i < DPA_GetPtrCount(dpaHandlesList); ++i)
-			{
-				DWORD dwStatus = ep_dwm_PatchProcess(wszUDWMPath, DPA_FastGetPtr(dpaHandlesList, i), dpaOffsetList, dpaOldCodeList);
-				if (dwStatus != EP_DWM_PATCH_ERROR_SUCCESS)
-				{
-					ep_dwm_g_ExitCode = EP_DWM_PATCH_ERROR_MASK & dwStatus;
-				}
-			}
-			DPA_DestroyCallback(dpaHandlesList, ep_dwm_DestroyHandle, dpaExclusionList);
+			CLEAR_AND_DEPATCH(EP_DWM_REASON_TERMINATION_BYUSER);
 			break;
 		}
 
-		BOOL bPatchHasCrashedDWM = FALSE;
+		// Check if any of the processes has terminated, then it's likely the patch crashed it
 		for (unsigned int i = EP_DWM_NUM_EVENTS; i < DPA_GetPtrCount(dpaHandlesList); ++i)
 		{
 			if (WaitForSingleObject(DPA_FastGetPtr(dpaHandlesList, i), 0) == WAIT_OBJECT_0)
 			{
-				bPatchHasCrashedDWM = TRUE;
-				break;
+				REPORT_ON_PROCESS(TRUE, i);
 			}
 		}
-		if (bPatchHasCrashedDWM)
+		if (dwFailedNum)
 		{
+			// If one of the processes just closed, wait a bit and repatch
+			if (!dwRes)
+			{
+				if (WaitForSingleObject(ep_dwm_g_ServiceStopEvent, EP_DWM_SETUP_TIME) == WAIT_OBJECT_0)
+				{
+					CLEAR_AND_DEPATCH(EP_DWM_REASON_TERMINATION_BYUSER);
+					break;
+				}
+				CLEAR(EP_DWM_REASON_NONE);
+				OutputDebugStringW(L"ep_dwm: Retry (line " _T(STRINGER(__LINE__)) L").\n");
+				continue;
+			}
+			// If at least one process crashed, unpatch the rest and give up
+			CLEAR_AND_DEPATCH(EP_DWM_REASON_EARLIER_ERROR);
 			break;
 		}
 
-		DWORD dwRes = WaitForMultipleObjects(DPA_GetPtrCount(dpaHandlesList), DPA_GetPtrPtr(dpaHandlesList), FALSE, INFINITE);
-		if (dwRes == WAIT_OBJECT_0)
+		// Wait for an external signal or for any of the processes to terminate
+		OutputDebugStringW(L"ep_dwm: Waiting for a signal or process termination.\n");
+		DWORD dwRv = WaitForMultipleObjects(DPA_GetPtrCount(dpaHandlesList), DPA_GetPtrPtr(dpaHandlesList), FALSE, INFINITE);
+		OutputDebugStringW(L"ep_dwm: Wait finished due to:\n");
+		if (dwRv == WAIT_OBJECT_0)
 		{
-			for (unsigned int i = EP_DWM_NUM_EVENTS; i < DPA_GetPtrCount(dpaHandlesList); ++i)
-			{
-				DWORD dwStatus = ep_dwm_PatchProcess(wszUDWMPath, DPA_FastGetPtr(dpaHandlesList, i), dpaOffsetList, dpaOldCodeList);
-				if (dwStatus != EP_DWM_PATCH_ERROR_SUCCESS)
-				{
-					ep_dwm_g_ExitCode = EP_DWM_PATCH_ERROR_MASK & dwStatus;
-				}
-			}
-		}
-		DPA_DestroyCallback(dpaHandlesList, ep_dwm_DestroyHandle, dpaExclusionList);
-		if (dwRes == WAIT_OBJECT_0)
-		{
+			// Service is stopping by user action, so unpatch
+			CLEAR_AND_DEPATCH(EP_DWM_REASON_TERMINATION_BYUSER);
 			break;
 		}
+		else if (dwRv == WAIT_OBJECT_0 + 1)
+		{
+			// Another user logged on, likely to have a new DWM instance, wait a bit and then recreate the process list
+			OutputDebugStringW(L"ep_dwm: User logon.\n");
+			if (WaitForSingleObject(ep_dwm_g_ServiceStopEvent, EP_DWM_SETUP_TIME) == WAIT_OBJECT_0)
+			{
+				CLEAR_AND_DEPATCH(EP_DWM_REASON_TERMINATION_BYUSER);
+				break;
+			}
+			CLEAR(EP_DWM_REASON_NONE);
+		}
+		else
+		{
+			// One of the DWM processes has closed
+			REPORT_ON_PROCESS(FALSE, dwRv - WAIT_OBJECT_0);
+			CLEAR(EP_DWM_REASON_NONE);
+		}
+		OutputDebugStringW(L"ep_dwm: Retry (line " _T(STRINGER(__LINE__)) L").\n");
 	}
 
 	DPA_DestroyCallback(dpaOldCodeList, ep_dwm_DestroyOldCode, NULL);
 	DPA_Destroy(dpaOffsetList);
 	DPA_Destroy(dpaExclusionList);
-
-	return 0;
+	OutputDebugStringW(L"ep_dwm: Exiting service thread.\n");
+	return dwRes;
 }
 
 static void WINAPI ep_dwm_ServiceCtrlHandlerEx(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext)
@@ -349,20 +460,28 @@ static void WINAPI ep_dwm_ServiceCtrlHandlerEx(DWORD dwControl, DWORD dwEventTyp
 	switch (dwControl)
 	{
 	case SERVICE_CONTROL_SESSIONCHANGE:
-		SetEvent(ep_dwm_g_ServiceSessionChangeEvent);
+		if (dwEventType == WTS_SESSION_LOGON)
+		{
+			OutputDebugStringW(L"ep_dwm: SERVICE_CONTROL_SESSIONCHANGE(WTS_SESSION_LOGON).\n");
+			SetEvent(ep_dwm_g_ServiceSessionChangeEvent);
+		}
+		break;
 	case SERVICE_CONTROL_STOP:
 		if (ep_dwm_g_ServiceStatus.dwCurrentState != SERVICE_RUNNING)
 		{
+			OutputDebugStringW(L"ep_dwm: The user requested service termination, but the service is already terminating!\n");
 			break;
 		}
 		ep_dwm_g_ServiceStatus.dwControlsAccepted = 0;
 		ep_dwm_g_ServiceStatus.dwCurrentState = SERVICE_STOP_PENDING;
-		ep_dwm_g_ServiceStatus.dwWin32ExitCode = 0;
-		ep_dwm_g_ServiceStatus.dwCheckPoint = 4;
+		ep_dwm_g_ServiceStatus.dwWin32ExitCode = __LINE__;
+		ep_dwm_g_ServiceStatus.dwCheckPoint = 5;
 		if (SetServiceStatus(ep_dwm_g_StatusHandle, &ep_dwm_g_ServiceStatus) == FALSE)
 		{
 			// error
+			OutputDebugStringW(L"ep_dwm: SetServiceStatus (line " _T(STRINGER(__LINE__)) L")!\n");
 		}
+		OutputDebugStringW(L"ep_dwm: User requested service termination.\n");
 		SetEvent(ep_dwm_g_ServiceStopEvent);
 		break;
 	default:
@@ -380,6 +499,7 @@ void WINAPI ep_dwm_ServiceMain(DWORD argc, LPTSTR* argv)
 		{
 			CloseHandle(ep_dwm_g_Service);
 		}
+		OutputDebugStringW(L"ep_dwm: Service is already running!\n");
 		return;
 	}
 
@@ -388,6 +508,7 @@ void WINAPI ep_dwm_ServiceMain(DWORD argc, LPTSTR* argv)
 	if (ep_dwm_g_StatusHandle == NULL)
 	{
 		// error
+		OutputDebugStringW(L"ep_dwm: Unable to register service with the SCM!\n");
 		CloseHandle(ep_dwm_g_Service);
 		return;
 	}
@@ -397,12 +518,13 @@ void WINAPI ep_dwm_ServiceMain(DWORD argc, LPTSTR* argv)
 	ep_dwm_g_ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
 	ep_dwm_g_ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SESSIONCHANGE;
 	ep_dwm_g_ServiceStatus.dwCurrentState = SERVICE_START_PENDING;
-	ep_dwm_g_ServiceStatus.dwWin32ExitCode = NO_ERROR;
+	ep_dwm_g_ServiceStatus.dwWin32ExitCode = __LINE__;
 	ep_dwm_g_ServiceStatus.dwServiceSpecificExitCode = 0;
 	ep_dwm_g_ServiceStatus.dwCheckPoint = 0;
 	if (SetServiceStatus(ep_dwm_g_StatusHandle, &ep_dwm_g_ServiceStatus) == FALSE)
 	{
 		// error
+		OutputDebugStringW(L"ep_dwm: SetServiceStatus (line " _T(STRINGER(__LINE__)) L")!\n");
 		CloseHandle(ep_dwm_g_Service);
 		return;
 	}
@@ -422,29 +544,29 @@ void WINAPI ep_dwm_ServiceMain(DWORD argc, LPTSTR* argv)
 		}
 		ep_dwm_g_ServiceStatus.dwControlsAccepted = 0;
 		ep_dwm_g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
-		ep_dwm_g_ServiceStatus.dwWin32ExitCode = GetLastError();
+		ep_dwm_g_ServiceStatus.dwWin32ExitCode = __LINE__;
 		ep_dwm_g_ServiceStatus.dwCheckPoint = 1;
-		if (SetServiceStatus(
-			ep_dwm_g_StatusHandle,
-			&ep_dwm_g_ServiceStatus
-		) == FALSE)
+		if (SetServiceStatus(ep_dwm_g_StatusHandle,	&ep_dwm_g_ServiceStatus) == FALSE)
 		{
 			// error
+			OutputDebugStringW(L"ep_dwm: SetServiceStatus (line " _T(STRINGER(__LINE__)) L")!\n");
 		}
+		OutputDebugStringW(L"ep_dwm: Unable to create events!\n");
 		CloseHandle(ep_dwm_g_Service);
 		return;
 	}
 
 	// Inform SCM the service has started
-	ep_dwm_g_ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+	ep_dwm_g_ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SESSIONCHANGE;
 	ep_dwm_g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
-	ep_dwm_g_ServiceStatus.dwWin32ExitCode = 0;
-	ep_dwm_g_ServiceStatus.dwCheckPoint = 0;
+	ep_dwm_g_ServiceStatus.dwWin32ExitCode = __LINE__;
+	ep_dwm_g_ServiceStatus.dwCheckPoint = 2;
 	if (SetServiceStatus(ep_dwm_g_StatusHandle, &ep_dwm_g_ServiceStatus) == FALSE)
 	{
+		// error
+		OutputDebugStringW(L"ep_dwm: SetServiceStatus (line " _T(STRINGER(__LINE__)) L")!\n");
 		CloseHandle(ep_dwm_g_ServiceStopEvent);
 		CloseHandle(ep_dwm_g_ServiceSessionChangeEvent);
-		// error
 		CloseHandle(ep_dwm_g_Service);
 		return;
 	}
@@ -455,37 +577,40 @@ void WINAPI ep_dwm_ServiceMain(DWORD argc, LPTSTR* argv)
 	{
 		ep_dwm_g_ServiceStatus.dwControlsAccepted = 0;
 		ep_dwm_g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
-		ep_dwm_g_ServiceStatus.dwWin32ExitCode = GetLastError();
-		ep_dwm_g_ServiceStatus.dwCheckPoint = 1;
+		ep_dwm_g_ServiceStatus.dwWin32ExitCode = __LINE__;
+		ep_dwm_g_ServiceStatus.dwCheckPoint = 3;
 		if (SetServiceStatus(ep_dwm_g_StatusHandle, &ep_dwm_g_ServiceStatus) == FALSE)
 		{
+			// error
+			OutputDebugStringW(L"ep_dwm: SetServiceStatus (line " _T(STRINGER(__LINE__)) L")!\n");
 			CloseHandle(ep_dwm_g_ServiceStopEvent);
 			CloseHandle(ep_dwm_g_ServiceSessionChangeEvent);
-			// error
 		}
 		CloseHandle(ep_dwm_g_Service);
+		OutputDebugStringW(L"ep_dwm: Unable to create service thread!\n");
 		return;
 	}
 
 	// Wait until our worker thread exits signaling that the service needs to stop
 	WaitForSingleObject(hServiceThread, INFINITE);
 
-	CloseHandle(hServiceThread);
-	CloseHandle(ep_dwm_g_ServiceStopEvent);
-	CloseHandle(ep_dwm_g_ServiceSessionChangeEvent);
-
 	// Inform SCM the service has stopped
 	ep_dwm_g_ServiceStatus.dwControlsAccepted = 0;
 	ep_dwm_g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
-	ep_dwm_g_ServiceStatus.dwWin32ExitCode = ep_dwm_g_ExitCode;
-	ep_dwm_g_ServiceStatus.dwCheckPoint = 3;
-
+	GetExitCodeThread(hServiceThread, &ep_dwm_g_ServiceStatus.dwWin32ExitCode);
+	ep_dwm_g_ServiceStatus.dwCheckPoint = 4;
 	if (SetServiceStatus(ep_dwm_g_StatusHandle, &ep_dwm_g_ServiceStatus) == FALSE)
 	{
 		// error
+		OutputDebugStringW(L"ep_dwm: SetServiceStatus (line " _T(STRINGER(__LINE__)) L")!\n");
 	}
 
+	CloseHandle(hServiceThread);
+	CloseHandle(ep_dwm_g_ServiceStopEvent);
+	CloseHandle(ep_dwm_g_ServiceSessionChangeEvent);
 	CloseHandle(ep_dwm_g_Service);
+
+	OutputDebugStringW(L"ep_dwm: Service has terminated.\n");
 	return;
 }
 
