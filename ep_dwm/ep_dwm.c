@@ -25,6 +25,8 @@ char ep_dwm_patch_data[1][4] = { {0x31, 0xC0, 0xFF, 0xC0} };
 // inc eax
 unsigned int ep_dwm_patch_length[1] = { 4 };
 
+unsigned int ep_dwm_expected_matches = 4;
+
 #define STRINGER_INTERNAL(x) #x
 #define STRINGER(x) STRINGER_INTERNAL(x)
 
@@ -282,7 +284,7 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 	DPA_AppendPtr(dpaExclusionList, ep_dwm_g_ServiceStopEvent);
 	DPA_AppendPtr(dpaExclusionList, ep_dwm_g_ServiceSessionChangeEvent);
 
-	while (TRUE)
+	while (DPA_GetPtrCount(dpaOffsetList) == ep_dwm_expected_matches)
 	{
 		DWORD dwFailedNum = 0;
 
