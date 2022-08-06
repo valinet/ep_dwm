@@ -15,17 +15,20 @@ HANDLE                ep_dwm_g_ServiceSessionChangeEvent = INVALID_HANDLE_VALUE;
 #define               EP_DWM_REASON_NONE 0
 #define               EP_DWM_REASON_TERMINATION_BYUSER 1
 #define               EP_DWM_REASON_EARLIER_ERROR 2
-char ep_dwm_pattern_data[1][6] = { {0x0F, 0x57, 0xF6, 0xF3, 0x48, 0x0F} };
+char ep_dwm_pattern_data[1][20] = { {0x0F, 0x57, 0xF6, 0xF3, 0x48, 0x0F} };
 // xorps xmm6, xmm6
 // cvtsi2ss xmm6, rax
 unsigned int ep_dwm_pattern_length[1] = { 6 };
 // this patch always replaces 4 bytes coresponding to a "mov eax, [reg+offh+arg]" operation
-char ep_dwm_patch_data[1][4] = { {0x31, 0xC0, 0xFF, 0xC0} };
+char ep_dwm_patch_data[1][20] = { {0x31, 0xC0, 0xFF, 0xC0} };
 // xor eax, eax
 // inc eax
 unsigned int ep_dwm_patch_length[1] = { 4 };
 
 unsigned int ep_dwm_expected_matches = 4;
+
+unsigned int ep_dwm_strategy = 0;
+int ep_dwm_strategy_1_order = -1;
 
 #define STRINGER_INTERNAL(x) #x
 #define STRINGER(x) STRINGER_INTERNAL(x)
@@ -144,8 +147,16 @@ static DWORD ep_dwm_DeterminePatchAddresses(WCHAR* wszUDWMPath, HDPA dpaOffsetLi
 								break;
 							}
 						}
-						if (!bContains)
+						BOOL bPassedCheck = TRUE;
+						if (ep_dwm_strategy == 1)
 						{
+							UINT32 offset = *(UINT32*)(pCandidate + 4);
+							UINT32 value = *(UINT32*)(pCandidate + offset + 0x8);
+							if (!(value == 0x41000000 /* 8.0 */ || value == 0x40800000 /* 4.0 */)) bPassedCheck = FALSE;
+						}
+						if (bPassedCheck && !bContains)
+						{
+							if (ep_dwm_strategy == 1 && (*(char*)(pCandidate + 8) & 0xFF) == 0x0f && (*(char*)(pCandidate + 9) & 0xFF) == 0x28 && (*(char*)(pCandidate + 10) & 0xFF) == 0xc6) ep_dwm_strategy_1_order = (DPA_GetPtrCount(dpaOffsetList) == 0 ? 0 : 1);
 							DPA_AppendPtr(dpaOffsetList, pCandidate - hModule);
 							char* pOldCode = malloc(ep_dwm_patch_length[0] * sizeof(char));
 							if (!pOldCode)
@@ -156,7 +167,9 @@ static DWORD ep_dwm_DeterminePatchAddresses(WCHAR* wszUDWMPath, HDPA dpaOffsetLi
 								}
 								return __LINE__;
 							}
-							memcpy(pOldCode, pCandidate - ep_dwm_patch_length[0], ep_dwm_patch_length[0]);
+							int offset = (0 - ep_dwm_patch_length[0]);
+							if (ep_dwm_strategy == 1) offset = 0;
+							memcpy(pOldCode, pCandidate + offset, ep_dwm_patch_length[0]);
 							DPA_AppendPtr(dpaPatchList, pOldCode);
 						}
 						pCandidate += ep_dwm_pattern_length[0];
@@ -209,20 +222,30 @@ static DWORD ep_dwm_PatchProcess(WCHAR* wszUDWMPath, HANDLE hProcess, HDPA dpaOf
 				{
 					DWORD dwOldProtect = 0;
 					SIZE_T dwNumberOfBytesWritten = 0;
-					if (!VirtualProtectEx(hProcess, me32.modBaseAddr + (uintptr_t)DPA_FastGetPtr(dpaOffsetList, j) - ep_dwm_patch_length[0], ep_dwm_patch_length[0], PAGE_EXECUTE_READWRITE, &dwOldProtect))
+					int offset = (0 - ep_dwm_patch_length[0]);
+					if (ep_dwm_strategy == 1) offset = 0;
+					if (ep_dwm_strategy == 1 && (ep_dwm_strategy_1_order == 0 ? (j == 0 || j == 1) : (j == 2 || j == 3))) {
+						ep_dwm_patch_data[0][0] = 0xB0; // change working register to al/rax
+						ep_dwm_patch_data[0][6] = 0xF0;
+					}
+					if (!VirtualProtectEx(hProcess, me32.modBaseAddr + (uintptr_t)DPA_FastGetPtr(dpaOffsetList, j) + offset, ep_dwm_patch_length[0], PAGE_EXECUTE_READWRITE, &dwOldProtect))
 					{
 						OutputDebugStringW(L"ep_dwm: Failed (VirtualProtectEx) (line " _T(STRINGER(__LINE__)) L")!\n");
 						dwRes = __LINE__;
 					}
 					else
 					{
-						WriteProcessMemory(hProcess, me32.modBaseAddr + (uintptr_t)DPA_FastGetPtr(dpaOffsetList, j) - ep_dwm_patch_length[0], dpaOldCodeList ? DPA_FastGetPtr(dpaOldCodeList, j) : ep_dwm_patch_data[0], ep_dwm_patch_length[0], &dwNumberOfBytesWritten);
+						WriteProcessMemory(hProcess, me32.modBaseAddr + (uintptr_t)DPA_FastGetPtr(dpaOffsetList, j) + offset, dpaOldCodeList ? DPA_FastGetPtr(dpaOldCodeList, j) : ep_dwm_patch_data[0], ep_dwm_patch_length[0], &dwNumberOfBytesWritten);
 						if (!dwNumberOfBytesWritten || dwNumberOfBytesWritten != ep_dwm_patch_length[0])
 						{
 							OutputDebugStringW(L"ep_dwm: Failed (WriteProcessMemory) (line " _T(STRINGER(__LINE__)) L")!\n");
 							dwRes = __LINE__;
 						}
-						VirtualProtectEx(hProcess, me32.modBaseAddr + (uintptr_t)DPA_FastGetPtr(dpaOffsetList, j) - ep_dwm_patch_length[0], ep_dwm_patch_length[0], dwOldProtect, &dwOldProtect);
+						VirtualProtectEx(hProcess, me32.modBaseAddr + (uintptr_t)DPA_FastGetPtr(dpaOffsetList, j) + offset, ep_dwm_patch_length[0], dwOldProtect, &dwOldProtect);
+					}
+					if (ep_dwm_strategy == 1 && (ep_dwm_strategy_1_order == 0 ? (j == 0 || j == 1) : (j == 2 || j == 3))) {
+						ep_dwm_patch_data[0][0] = 0xB1; // revert change to register cl/rcx
+						ep_dwm_patch_data[0][6] = 0xF1;
 					}
 				}
 				break;
@@ -244,6 +267,25 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 	HDPA dpaHandlesList = NULL;
 	HDPA dpaOffsetList = NULL;
 	HDPA dpaOldCodeList = NULL;
+
+	ep_dwm_strategy = (ep_dwm_IsWindows11Version22H2OrHigher() ? 1 : 0);
+	if (ep_dwm_strategy == 1)
+	{
+		ep_dwm_pattern_data[0][0] = 0xF3; // movss xmm6, ...
+		ep_dwm_pattern_data[0][1] = 0x0F;
+		ep_dwm_pattern_data[0][2] = 0x10;
+		ep_dwm_pattern_data[0][3] = 0x35;
+		ep_dwm_pattern_length[0] = 4;
+		ep_dwm_patch_data[0][0] = 0xB1; // mov cl, 1
+		ep_dwm_patch_data[0][1] = 0x01;
+		ep_dwm_patch_data[0][2] = 0xF3; // cvtsi2ss xmm6,rcx
+		ep_dwm_patch_data[0][3] = 0x48;
+		ep_dwm_patch_data[0][4] = 0x0F;
+		ep_dwm_patch_data[0][5] = 0x2A;
+		ep_dwm_patch_data[0][6] = 0xF1;
+		ep_dwm_patch_data[0][7] = 0x90;
+		ep_dwm_patch_length[0] = 8;
+	}
 
 	WCHAR wszDWMPath[MAX_PATH];
 	GetSystemDirectoryW(wszDWMPath, MAX_PATH);

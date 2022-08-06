@@ -9,6 +9,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #include <Psapi.h>
 #pragma comment(lib, "Comctl32.lib")
 #include <tchar.h>
+#pragma comment(lib, "version.lib")
 
 void WINAPI ep_dwm_ServiceMain(DWORD argc, LPTSTR* argv);
 BOOL ep_dwm_StartService(LPWSTR wszServiceName, LPWSTR wszEventName);
@@ -60,5 +61,52 @@ inline void* ep_dwm_memmem(void* haystack, size_t haystacklen, void* needle, siz
 
     free(out);
     return rv;
+}
+
+BOOL ep_dwm_IsWindows11Version22H2OrHigher()
+{
+    // Avoid manifesting the exe
+    // https://stackoverflow.com/questions/25986331/how-to-determine-windows-version-in-future-proof-way
+
+    static const wchar_t kernel32[] = L"\\kernel32.dll";
+    wchar_t* path = NULL;
+    void* ver = NULL, * block;
+    UINT n;
+    BOOL r;
+    DWORD versz, blocksz;
+    VS_FIXEDFILEINFO* vinfo;
+
+    path = malloc(sizeof(*path) * MAX_PATH);
+    if (!path)
+        return FALSE;
+
+    n = GetSystemDirectoryW(path, MAX_PATH);
+    if (n >= MAX_PATH || n == 0 ||
+        n > MAX_PATH - sizeof(kernel32) / sizeof(*kernel32))
+        return FALSE;
+    memcpy(path + n, kernel32, sizeof(kernel32));
+
+    versz = GetFileVersionInfoSizeW(path, NULL);
+    if (versz == 0)
+        return FALSE;
+    ver = malloc(versz);
+    if (!ver)
+        return FALSE;
+    r = GetFileVersionInfoW(path, 0, versz, ver);
+    if (!r)
+        return FALSE;
+    r = VerQueryValueW(ver, L"\\", &block, &blocksz);
+    if (!r || blocksz < sizeof(VS_FIXEDFILEINFO))
+        return FALSE;
+    vinfo = (VS_FIXEDFILEINFO*)block;
+    //printf(
+    //    "Windows version: %d.%d.%d.%d",
+    //    (int)HIWORD(vinfo->dwProductVersionMS), // 10
+    //    (int)LOWORD(vinfo->dwProductVersionMS), // 0
+    //    (int)HIWORD(vinfo->dwProductVersionLS), // 22000
+    //    (int)LOWORD(vinfo->dwProductVersionLS));// 708
+    free(path);
+    free(ver);
+    return ((int)HIWORD(vinfo->dwProductVersionLS) >= 22621);
 }
 #endif
