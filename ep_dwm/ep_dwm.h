@@ -99,6 +99,7 @@ BOOL ep_dwm_IsWindows11Version22H2OrHigher()
     if (!r || blocksz < sizeof(VS_FIXEDFILEINFO))
         return FALSE;
     vinfo = (VS_FIXEDFILEINFO*)block;
+    BOOL result = ((int)HIWORD(vinfo->dwProductVersionLS) >= 22621);
     //printf(
     //    "Windows version: %d.%d.%d.%d",
     //    (int)HIWORD(vinfo->dwProductVersionMS), // 10
@@ -107,6 +108,6 @@ BOOL ep_dwm_IsWindows11Version22H2OrHigher()
     //    (int)LOWORD(vinfo->dwProductVersionLS));// 708
     free(path);
     free(ver);
-    return ((int)HIWORD(vinfo->dwProductVersionLS) >= 22621);
+    return result;
 }
 #endif
