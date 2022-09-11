@@ -393,7 +393,7 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 		CloseHandle(hSnapshot);
 
 		// If process list is empty, retry
-		if (DPA_GetPtrCount(dpaHandlesList) == 0)
+		if (DPA_GetPtrCount(dpaHandlesList) <= DPA_GetPtrCount(dpaExclusionList))
 		{
 			DPA_Destroy(dpaHandlesList);
 			OutputDebugStringW(L"ep_dwm: Desktop Window Manager is not running!\n");
