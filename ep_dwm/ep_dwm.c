@@ -15,20 +15,6 @@ HANDLE                ep_dwm_g_ServiceSessionChangeEvent = INVALID_HANDLE_VALUE;
 #define               EP_DWM_REASON_NONE 0
 #define               EP_DWM_REASON_TERMINATION_BYUSER 1
 #define               EP_DWM_REASON_EARLIER_ERROR 2
-char ep_dwm_pattern_data[1][20] = { {0x0F, 0x57, 0xF6, 0xF3, 0x48, 0x0F} };
-// xorps xmm6, xmm6
-// cvtsi2ss xmm6, rax
-unsigned int ep_dwm_pattern_length[1] = { 6 };
-// this patch always replaces 4 bytes coresponding to a "mov eax, [reg+offh+arg]" operation
-char ep_dwm_patch_data[1][20] = { {0x31, 0xC0, 0xFF, 0xC0} };
-// xor eax, eax
-// inc eax
-unsigned int ep_dwm_patch_length[1] = { 4 };
-
-unsigned int ep_dwm_expected_matches = 4;
-
-unsigned int ep_dwm_strategy = 0;
-int ep_dwm_strategy_1_order = -1;
 
 #define STRINGER_INTERNAL(x) #x
 #define STRINGER(x) STRINGER_INTERNAL(x)
@@ -42,7 +28,7 @@ int ep_dwm_strategy_1_order = -1;
 #define CLEAR_AND_DEPATCH(x) { \
 	for (unsigned int i = EP_DWM_NUM_EVENTS; i < DPA_GetPtrCount(dpaHandlesList); ++i) \
 	{ \
-		ep_dwm_PatchProcess(wszUDWMPath, DPA_FastGetPtr(dpaHandlesList, i), dpaOffsetList, dpaOldCodeList); \
+		ep_dwm_PatchProcess(wszUDWMPath, DPA_FastGetPtr(dpaHandlesList, i), dpaPatchSites, /*bRestore*/ TRUE); \
 	} \
 	CLEAR(x); \
 }
@@ -78,9 +64,18 @@ int ep_dwm_strategy_1_order = -1;
 	} \
 }
 
-static int ep_dwm_DestroyOldCode(void* p, void* pUnused)
+typedef struct PatchSite
 {
-	free(p);
+	UINT_PTR offset;
+	BYTE newCode[8];
+	BYTE oldCode[8];
+	DWORD codeLength;
+} PatchSite;
+
+static int ep_dwm_DestroyPatchSite(void* p, void* pUnused)
+{
+	PatchSite* ps = p;
+	free(ps);
 	return 1;
 }
 
@@ -101,105 +96,230 @@ static int ep_dwm_DestroyHandle(HANDLE h, HDPA dpaExclusionList)
 	return 1;
 }
 
-static DWORD ep_dwm_DeterminePatchAddresses(WCHAR* wszUDWMPath, HDPA dpaOffsetList, HDPA dpaPatchList)
+static BOOL MaskCompare(PVOID pBuffer, LPCSTR lpPattern, LPCSTR lpMask)
+{
+	for (PBYTE value = (PBYTE)pBuffer; *lpMask; ++lpPattern, ++lpMask, ++value)
+	{
+		if (*lpMask == 'x' && *(LPCBYTE)lpPattern != *value)
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+static __declspec(noinline) PVOID FindPatternHelper(PVOID pBase, SIZE_T dwSize, LPCSTR lpPattern, LPCSTR lpMask)
+{
+	for (SIZE_T index = 0; index < dwSize; ++index)
+	{
+		PBYTE pAddress = (PBYTE)pBase + index;
+
+		if (MaskCompare(pAddress, lpPattern, lpMask))
+			return pAddress;
+	}
+
+	return NULL;
+}
+
+PVOID FindPattern(PVOID pBase, SIZE_T dwSize, LPCSTR lpPattern, LPCSTR lpMask)
+{
+	dwSize -= strlen(lpMask);
+	return FindPatternHelper(pBase, dwSize, lpPattern, lpMask);
+}
+
+#if defined(_M_ARM64)
+__forceinline DWORD ARM64_ReadBits(DWORD value, int h, int l)
+{
+	return (value >> l) & ((1 << (h - l + 1)) - 1);
+}
+
+__forceinline int ARM64_SignExtend(DWORD value, int numBits)
+{
+	DWORD mask = 1 << (numBits - 1);
+	if (value & mask)
+		value |= ~((1 << numBits) - 1);
+	return (int)value;
+}
+
+__forceinline int ARM64_ReadBitsSignExtend(DWORD insn, int h, int l)
+{
+	return ARM64_SignExtend(ARM64_ReadBits(insn, h, l), h - l + 1);
+}
+
+__forceinline BOOL ARM64_IsInRange(int value, int bitCount)
+{
+	int minVal = -(1 << (bitCount - 1));
+	int maxVal = (1 << (bitCount - 1)) - 1;
+	return value >= minVal && value <= maxVal;
+}
+
+__forceinline BOOL ARM64_IsBL(DWORD insn) { return ARM64_ReadBits(insn, 31, 26) == 0b100101; }
+
+__forceinline DWORD* ARM64_FollowBL(DWORD* pInsnBL)
+{
+	DWORD insnBL = *pInsnBL;
+	if (!ARM64_IsBL(insnBL))
+		return NULL;
+	int imm26 = ARM64_ReadBitsSignExtend(insnBL, 25, 0);
+	return pInsnBL + imm26; // offset = imm26 * 4
+}
+
+__forceinline DWORD ARM64_MakeB(int imm26)
+{
+	if (!ARM64_IsInRange(imm26, 26))
+		return 0;
+	return 0b000101 << 26 | imm26 & (1 << 26) - 1;
+}
+#endif
+
+static DWORD ep_dwm_DeterminePatchAddresses(const WCHAR* pwszUDWMPath, HDPA dpaPatchSites)
 {
 	DWORD dwRes = 0;
 
-	HMODULE hModule = LoadLibraryW(wszUDWMPath, NULL, LOAD_LIBRARY_AS_DATAFILE);
+	HMODULE hModule = LoadLibraryW(pwszUDWMPath);
 	if (!hModule)
 	{
 		OutputDebugStringW(L"ep_dwm: Failed (LoadLibraryW) (line " _T(STRINGER(__LINE__)) L")!\n");
 		return __LINE__;
 	}
 
-	void* p = NULL;
-	uintptr_t diff = 0;
-	PIMAGE_DOS_HEADER dosHeader = hModule;
+	PBYTE beginText = NULL;
+	DWORD sizeText = 0;
+
+	PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hModule;
 	if (dosHeader->e_magic == IMAGE_DOS_SIGNATURE)
 	{
 		PIMAGE_NT_HEADERS64 ntHeader = (PIMAGE_NT_HEADERS64)((u_char*)dosHeader + dosHeader->e_lfanew);
 		if (ntHeader->Signature == IMAGE_NT_SIGNATURE)
 		{
-			PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(ntHeader);
+			PIMAGE_SECTION_HEADER firstSection = IMAGE_FIRST_SECTION(ntHeader);
 			for (unsigned int i = 0; i < ntHeader->FileHeader.NumberOfSections; ++i)
 			{
-				if ((section->Characteristics & IMAGE_SCN_CNT_CODE) && section->SizeOfRawData)
+				PIMAGE_SECTION_HEADER section = firstSection + i;
+				if (!strncmp(section->Name, ".text", 5))
 				{
-					char* pCandidate = NULL;
-					while (TRUE)
-					{
-						pCandidate = ep_dwm_memmem(
-							!pCandidate ? hModule + section->VirtualAddress : pCandidate,
-							!pCandidate ? section->SizeOfRawData : (uintptr_t)section->SizeOfRawData - (uintptr_t)(pCandidate - (hModule + section->VirtualAddress)),
-							ep_dwm_pattern_data[0],
-							ep_dwm_pattern_length[0]
-						);
-						if (!pCandidate)
-						{
-							break;
-						}
-						BOOL bContains = FALSE;
-						for (unsigned j = 0; j < DPA_GetPtrCount(dpaOffsetList); ++j)
-						{
-							if (DPA_FastGetPtr(dpaOffsetList, j) == pCandidate - hModule)
-							{
-								bContains = TRUE;
-								break;
-							}
-						}
-						BOOL bPassedCheck = TRUE;
-						if (ep_dwm_strategy == 1)
-						{
-							UINT32 offset = *(UINT32*)(pCandidate + 4);
-							UINT32 value = *(UINT32*)(pCandidate + offset + 0x8);
-							if (!(value == 0x41000000 /* 8.0 */ || value == 0x40800000 /* 4.0 */)) bPassedCheck = FALSE;
-						}
-						if (bPassedCheck && !bContains)
-						{
-							if (ep_dwm_strategy == 1 && (*(char*)(pCandidate + 8) & 0xFF) == 0x0f && (*(char*)(pCandidate + 9) & 0xFF) == 0x28 && (*(char*)(pCandidate + 10) & 0xFF) == 0xc6) ep_dwm_strategy_1_order = (DPA_GetPtrCount(dpaOffsetList) == 0 ? 0 : 1);
-							DPA_AppendPtr(dpaOffsetList, pCandidate - hModule);
-							char* pOldCode = malloc(ep_dwm_patch_length[0] * sizeof(char));
-							if (!pOldCode)
-							{
-								for (unsigned int k = 0; k < DPA_GetPtrCount(dpaPatchList); ++k)
-								{
-									free(DPA_FastGetPtr(dpaPatchList, k));
-								}
-								return __LINE__;
-							}
-							int offset = (0 - ep_dwm_patch_length[0]);
-							if (ep_dwm_strategy == 1) offset = 0;
-							memcpy(pOldCode, pCandidate + offset, ep_dwm_patch_length[0]);
-							DPA_AppendPtr(dpaPatchList, pOldCode);
-						}
-						pCandidate += ep_dwm_pattern_length[0];
-						if (pCandidate > hModule + section->VirtualAddress + section->SizeOfRawData)
-						{
-							break;
-						}
-					}
+					beginText = (PBYTE)dosHeader + section->VirtualAddress;
+					sizeText = section->SizeOfRawData;
+					break;
 				}
 			}
 		}
 	}
+	if (!beginText || !sizeText)
+	{
+		return __LINE__;
+	}
+
+#if defined(_M_X64)
+	// CORNER_STYLE CTopLevelWindow::GetEffectiveCornerStyle()
+	// 48 83 EC 38 0F 29 74 24 20 0F 57 F6 E8 ?? ?? ?? ?? 83 E8 02
+	//                                        ^^^^^^^^^^^
+	// -> 48 C7 C0 01 00 00 00 C3
+	// Ref: float CTopLevelWindow::GetRadiusFromCornerStyle()
+	PBYTE match = FindPattern(
+		beginText, sizeText,
+		"\x48\x83\xEC\x38\x0F\x29\x74\x24\x20\x0F\x57\xF6\xE8\x00\x00\x00\x00\x83\xE8\x02",
+		"xxxxxxxxxxxxx????xxx"
+	);
+	if (match)
+	{
+		match += 12; // Point to E8
+		match += 5 + *(int*)(match + 1);
+	}
+	if (match)
+	{
+		PatchSite* site = calloc(1, sizeof(PatchSite));
+		if (site)
+		{
+			site->offset = match - (PBYTE)hModule;
+			site->codeLength = 8;
+			memcpy(site->newCode, "\x48\xC7\xC0\x01\x00\x00\x00\xC3", site->codeLength);
+			memcpy(site->oldCode, match, site->codeLength);
+			DPA_AppendPtr(dpaPatchSites, site);
+		}
+	}
+#elif defined(_M_ARM64)
+	// CORNER_STYLE CTopLevelWindow::GetEffectiveCornerStyle()
+	// E8 0F 1F FC FD 7B ?? A9 FD 03 00 91 08 E4 00 2F ?? ?? ?? ?? 1F ?? 00 71
+	//                                                 ^^^^^^^^^^^
+	// -> 20 00 80 D2 C0 03 5F D6
+	// Ref: float CTopLevelWindow::GetRadiusFromCornerStyle()
+	PBYTE match = FindPattern(
+		beginText, sizeText,
+		"\xE8\x0F\x1F\xFC\xFD\x7B\x00\xA9\xFD\x03\x00\x91\x08\xE4\x00\x2F\x00\x00\x00\x00\x1F\x00\x00\x71",
+		"xxxxxx?xxxxxxxxx????x?xx"
+	);
+	if (match)
+	{
+		match += 16;
+		match = (PBYTE)ARM64_FollowBL((DWORD*)match);
+	}
+	if (match)
+	{
+		PatchSite* site = calloc(1, sizeof(PatchSite));
+		if (site)
+		{
+			site->offset = match - (PBYTE)hModule;
+			site->codeLength = 8;
+			memcpy(site->newCode, "\x20\x00\x80\xD2\xC0\x03\x5F\xD6", site->codeLength);
+			memcpy(site->oldCode, match, site->codeLength);
+			DPA_AppendPtr(dpaPatchSites, site);
+		}
+	}
+
+	// Inlined occurrences of the above function (can also be in the function itself)
+	// 28 6D 40 39 68 00 00 34 28 75 40 39 ?? ?? 00 34 28 21 40 B9 1F 09 00 71 ?? ?? 00 54
+	//                                                                         ^^^^^^^^^^^ B.GE to B
+	// Max 3 occurrences
+	PBYTE cur = beginText;
+	for (int i = 0; i < 3; ++i)
+	{
+		match = FindPattern(
+			cur, sizeText - (cur - beginText),
+			"\x28\x6D\x40\x39\x68\x00\x00\x34\x28\x75\x40\x39\x00\x00\x00\x34\x28\x21\x40\xB9\x1F\x09\x00\x71\x00\x00\x00\x54",
+			"xxxxxxxxxxxx??xxxxxxxxxx??xx"
+		);
+		if (!match)
+			break; // No more matches
+
+		cur = match + 28;
+		match += 24; // Point to B.GE
+		DWORD insnBCond = *(DWORD*)match;
+		int cond = ARM64_ReadBits(insnBCond, 3, 0);
+		if (cond != 0b1010) // GE
+		{
+			--i; // Not this one
+			continue;
+		}
+
+		int imm19 = ARM64_ReadBitsSignExtend(insnBCond, 23, 5);
+		DWORD newInsn = ARM64_MakeB(imm19);
+		if (!newInsn)
+			continue;
+
+		PatchSite* site = calloc(1, sizeof(PatchSite));
+		if (site)
+		{
+			site->offset = match - (PBYTE)hModule;
+			site->codeLength = 4;
+			memcpy(site->newCode, &newInsn, site->codeLength);
+			memcpy(site->oldCode, match, site->codeLength);
+			DPA_AppendPtr(dpaPatchSites, site);
+		}
+	}
+#endif
 
 	FreeLibrary(hModule);
 
-	if (DPA_GetPtrCount(dpaOffsetList) != DPA_GetPtrCount(dpaPatchList))
-	{
-		OutputDebugStringW(L"ep_dwm: Different number of offsets and places to patch!\n");
-		dwRes == __LINE__;
-	}
-	if (DPA_GetPtrCount(dpaOffsetList) == 0)
+	if (DPA_GetPtrCount(dpaPatchSites) == 0)
 	{
 		OutputDebugStringW(L"ep_dwm: Unable to identify patch area!\n");
-		dwRes == __LINE__;
+		dwRes = __LINE__;
 	}
 
 	return dwRes;
 }
 
-static DWORD ep_dwm_PatchProcess(WCHAR* wszUDWMPath, HANDLE hProcess, HDPA dpaOffsetList, HDPA dpaOldCodeList)
+static DWORD ep_dwm_PatchProcess(const WCHAR* pwszUDWMPath, HANDLE hProcess, HDPA dpaPatchSites, BOOL bRestore)
 {
 	DWORD dwRes = 0;
 
@@ -216,41 +336,34 @@ static DWORD ep_dwm_PatchProcess(WCHAR* wszUDWMPath, HANDLE hProcess, HDPA dpaOf
 	{
 		do
 		{
-			if (!_wcsicmp(me32.szExePath, wszUDWMPath))
+			if (!_wcsicmp(me32.szExePath, pwszUDWMPath))
 			{
-				for (unsigned int j = 0; j < DPA_GetPtrCount(dpaOffsetList, j); ++j)
+				for (unsigned int j = 0; dwRes == 0 && j < DPA_GetPtrCount(dpaPatchSites); ++j)
 				{
+					PatchSite* ps = DPA_FastGetPtr(dpaPatchSites, j);
+
+					UINT_PTR pfn = me32.modBaseAddr + ps->offset;
 					DWORD dwOldProtect = 0;
 					SIZE_T dwNumberOfBytesWritten = 0;
-					int offset = (0 - ep_dwm_patch_length[0]);
-					if (ep_dwm_strategy == 1) offset = 0;
-					if (ep_dwm_strategy == 1 && (ep_dwm_strategy_1_order == 0 ? (j == 0 || j == 1) : (j == 2 || j == 3))) {
-						ep_dwm_patch_data[0][0] = 0xB0; // change working register to al/rax
-						ep_dwm_patch_data[0][6] = 0xF0;
-					}
-					if (!VirtualProtectEx(hProcess, me32.modBaseAddr + (uintptr_t)DPA_FastGetPtr(dpaOffsetList, j) + offset, ep_dwm_patch_length[0], PAGE_EXECUTE_READWRITE, &dwOldProtect))
+					if (!VirtualProtectEx(hProcess, (LPVOID)pfn, ps->codeLength, PAGE_EXECUTE_READWRITE, &dwOldProtect))
 					{
 						OutputDebugStringW(L"ep_dwm: Failed (VirtualProtectEx) (line " _T(STRINGER(__LINE__)) L")!\n");
 						dwRes = __LINE__;
+						break;
 					}
-					else
+
+					WriteProcessMemory(hProcess, (LPVOID)pfn, bRestore ? ps->oldCode : ps->newCode, ps->codeLength, &dwNumberOfBytesWritten);
+					if (!dwNumberOfBytesWritten || dwNumberOfBytesWritten != ps->codeLength)
 					{
-						WriteProcessMemory(hProcess, me32.modBaseAddr + (uintptr_t)DPA_FastGetPtr(dpaOffsetList, j) + offset, dpaOldCodeList ? DPA_FastGetPtr(dpaOldCodeList, j) : ep_dwm_patch_data[0], ep_dwm_patch_length[0], &dwNumberOfBytesWritten);
-						if (!dwNumberOfBytesWritten || dwNumberOfBytesWritten != ep_dwm_patch_length[0])
-						{
-							OutputDebugStringW(L"ep_dwm: Failed (WriteProcessMemory) (line " _T(STRINGER(__LINE__)) L")!\n");
-							dwRes = __LINE__;
-						}
-						VirtualProtectEx(hProcess, me32.modBaseAddr + (uintptr_t)DPA_FastGetPtr(dpaOffsetList, j) + offset, ep_dwm_patch_length[0], dwOldProtect, &dwOldProtect);
+						OutputDebugStringW(L"ep_dwm: Failed (WriteProcessMemory) (line " _T(STRINGER(__LINE__)) L")!\n");
+						dwRes = __LINE__;
 					}
-					if (ep_dwm_strategy == 1 && (ep_dwm_strategy_1_order == 0 ? (j == 0 || j == 1) : (j == 2 || j == 3))) {
-						ep_dwm_patch_data[0][0] = 0xB1; // revert change to register cl/rcx
-						ep_dwm_patch_data[0][6] = 0xF1;
-					}
+
+					VirtualProtectEx(hProcess, (LPVOID)pfn, ps->codeLength, dwOldProtect, &dwOldProtect);
 				}
 				break;
 			}
-		} while (Module32NextW(hSnapshot, &me32) == TRUE && dwRes == 0);
+		} while (dwRes == 0 && Module32NextW(hSnapshot, &me32) == TRUE);
 	}
 	CloseHandle(hSnapshot);
 
@@ -259,34 +372,6 @@ static DWORD ep_dwm_PatchProcess(WCHAR* wszUDWMPath, HANDLE hProcess, HDPA dpaOf
 
 static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 {
-	DWORD dwRes = __LINE__;
-
-	HANDLE hSnapshot = NULL;
-	PROCESSENTRY32 pe32;
-	HDPA dpaExclusionList = NULL;
-	HDPA dpaHandlesList = NULL;
-	HDPA dpaOffsetList = NULL;
-	HDPA dpaOldCodeList = NULL;
-
-	ep_dwm_strategy = (ep_dwm_IsWindows11Version22H2OrHigher() ? 1 : 0);
-	if (ep_dwm_strategy == 1)
-	{
-		ep_dwm_pattern_data[0][0] = 0xF3; // movss xmm6, ...
-		ep_dwm_pattern_data[0][1] = 0x0F;
-		ep_dwm_pattern_data[0][2] = 0x10;
-		ep_dwm_pattern_data[0][3] = 0x35;
-		ep_dwm_pattern_length[0] = 4;
-		ep_dwm_patch_data[0][0] = 0xB1; // mov cl, 1
-		ep_dwm_patch_data[0][1] = 0x01;
-		ep_dwm_patch_data[0][2] = 0xF3; // cvtsi2ss xmm6,rcx
-		ep_dwm_patch_data[0][3] = 0x48;
-		ep_dwm_patch_data[0][4] = 0x0F;
-		ep_dwm_patch_data[0][5] = 0x2A;
-		ep_dwm_patch_data[0][6] = 0xF1;
-		ep_dwm_patch_data[0][7] = 0x90;
-		ep_dwm_patch_length[0] = 8;
-	}
-
 	WCHAR wszDWMPath[MAX_PATH];
 	GetSystemDirectoryW(wszDWMPath, MAX_PATH);
 	wcscat_s(wszDWMPath, MAX_PATH, L"\\dwm.exe");
@@ -295,28 +380,20 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 	GetSystemDirectoryW(wszUDWMPath, MAX_PATH);
 	wcscat_s(wszUDWMPath, MAX_PATH, L"\\uDWM.dll");
 
-	dpaOffsetList = DPA_Create(EP_DWM_GROW);
-	if (!dpaOffsetList)
+	HDPA dpaPatchSites = DPA_Create(EP_DWM_GROW);
+	if (!dpaPatchSites)
 	{
 		OutputDebugStringW(L"ep_dwm: Failed (DPA_Create) (line " _T(STRINGER(__LINE__)) L")!\n");
-		dwRes = __LINE__;
-		return dwRes;
+		return __LINE__;
 	}
 
-	dpaOldCodeList = DPA_Create(EP_DWM_GROW);
-	if (!dpaOldCodeList)
-	{
-		OutputDebugStringW(L"ep_dwm: Failed (DPA_Create) (line " _T(STRINGER(__LINE__)) L")!\n");
-		dwRes = __LINE__;
-		return dwRes;
-	}
-
-	if (dwRes = ep_dwm_DeterminePatchAddresses(wszUDWMPath, dpaOffsetList, dpaOldCodeList))
+	DWORD dwRes = ep_dwm_DeterminePatchAddresses(wszUDWMPath, dpaPatchSites);
+	if (dwRes != 0)
 	{
 		return dwRes;
 	}
 
-	dpaExclusionList = DPA_Create(EP_DWM_NUM_EVENTS);
+	HDPA dpaExclusionList = DPA_Create(EP_DWM_NUM_EVENTS);
 	if (!dpaExclusionList)
 	{
 		dwRes = __LINE__;
@@ -326,11 +403,11 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 	DPA_AppendPtr(dpaExclusionList, ep_dwm_g_ServiceStopEvent);
 	DPA_AppendPtr(dpaExclusionList, ep_dwm_g_ServiceSessionChangeEvent);
 
-	while (DPA_GetPtrCount(dpaOffsetList) == ep_dwm_expected_matches)
+	while (TRUE)
 	{
 		DWORD dwFailedNum = 0;
 
-		dpaHandlesList = DPA_Create(EP_DWM_GROW);
+		HDPA dpaHandlesList = DPA_Create(EP_DWM_GROW);
 		if (!dpaHandlesList)
 		{
 			dwRes = __LINE__;
@@ -344,10 +421,10 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 		}
 
 		// Make list of dwm.exe processes
-		hSnapshot = NULL;
+		PROCESSENTRY32 pe32;
 		ZeroMemory(&pe32, sizeof(PROCESSENTRY32));
 		pe32.dwSize = sizeof(PROCESSENTRY32);
-		hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+		HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 		if (!hSnapshot)
 		{
 			DPA_Destroy(dpaHandlesList);
@@ -412,7 +489,7 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 		// Attempt to patch each process
 		for (unsigned int i = EP_DWM_NUM_EVENTS; i < DPA_GetPtrCount(dpaHandlesList); ++i)
 		{
-			if (ep_dwm_PatchProcess(wszUDWMPath, DPA_FastGetPtr(dpaHandlesList, i), dpaOffsetList, NULL))
+			if (ep_dwm_PatchProcess(wszUDWMPath, DPA_FastGetPtr(dpaHandlesList, i), dpaPatchSites, /*bRestore*/ FALSE))
 			{
 				dwFailedNum = i;
 				dwRes = __LINE__;
@@ -492,8 +569,7 @@ static DWORD WINAPI ep_dwm_ServiceThread(LPVOID lpUnused)
 		OutputDebugStringW(L"ep_dwm: Retry (line " _T(STRINGER(__LINE__)) L").\n");
 	}
 
-	DPA_DestroyCallback(dpaOldCodeList, ep_dwm_DestroyOldCode, NULL);
-	DPA_Destroy(dpaOffsetList);
+	DPA_DestroyCallback(dpaPatchSites, ep_dwm_DestroyPatchSite, NULL);
 	DPA_Destroy(dpaExclusionList);
 	OutputDebugStringW(L"ep_dwm: Exiting service thread.\n");
 	return dwRes;
