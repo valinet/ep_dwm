@@ -212,7 +212,8 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="ep_dwm.c" />
+    <ClCompile Include="ep_dwm_x64.c" Condition="'$(Platform)'=='x64'" />
+    <ClCompile Include="ep_dwm.c" Condition="'$(Platform)'=='ARM64'" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ep_dwm.h" />
