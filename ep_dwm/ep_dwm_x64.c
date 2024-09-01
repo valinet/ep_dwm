@@ -105,7 +105,7 @@ static DWORD ep_dwm_DeterminePatchAddresses(WCHAR* wszUDWMPath, HDPA dpaOffsetLi
 {
 	DWORD dwRes = 0;
 
-	HMODULE hModule = LoadLibraryW(wszUDWMPath, NULL, LOAD_LIBRARY_AS_DATAFILE);
+	HMODULE hModule = LoadLibraryW(wszUDWMPath);
 	if (!hModule)
 	{
 		OutputDebugStringW(L"ep_dwm: Failed (LoadLibraryW) (line " _T(STRINGER(__LINE__)) L")!\n");
