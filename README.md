@@ -14,7 +14,7 @@ The executable will be extracted in `C:\ep_dwm`. If you do not need them, you ca
 To register, type these commands in an elevated command window:
 
 ```
-sc.exe create ep_dwm binPath= "\"C:\ep_dwm\ep_dwm.exe\" ep_dwm Global\ep_dwm" DisplayName= "ep_dwm" start= auto
+sc.exe create ep_dwm binPath= "C:\ep_dwm\ep_dwm.exe ep_dwm Global\ep_dwm" DisplayName= "ep_dwm" start= auto
 sc.exe description ep_dwm "ep_dwm Service"
 sc.exe start ep_dwm
 ```
