@@ -70,9 +70,9 @@ BEGIN
             VALUE "CompanyName", "VALINET Solutions SRL"
             VALUE "FileDescription", "ExplorerPatcher Desktop Window Manager Service Process"
             VALUE "FileVersion", "2.0.0.0"
-            VALUE "InternalName", "ep_dwm.exe"
+            VALUE "InternalName", "ep_dwm_svc.exe"
             VALUE "LegalCopyright", "Copyright (C) 2006-2023 VALINET Solutions SRL. All rights reserved."
-            VALUE "OriginalFilename", "ep_dwm.exe"
+            VALUE "OriginalFilename", "ep_dwm_svc.exe"
             VALUE "ProductName", "ExplorerPatcher"
             VALUE "ProductVersion", "2.0.0.0"
         END
