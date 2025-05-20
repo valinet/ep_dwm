@@ -47,7 +47,7 @@ inline void* ep_dwm_memmem(void* haystack, size_t haystacklen, void* needle, siz
         if (text[i] == pattern[j]) {
             j++;
             if (j == needlelen) {
-                rv = text + (int)(i - needlelen + 1);
+                rv = text + (size_t)(i - needlelen + 1);
                 break;
             }
         }
