@@ -96,34 +96,108 @@ static int ep_dwm_DestroyHandle(HANDLE h, HDPA dpaExclusionList)
 	return 1;
 }
 
-static BOOL MaskCompare(PVOID pBuffer, LPCSTR lpPattern, LPCSTR lpMask)
+FORCEINLINE BOOL _MaskCompareByteLevel(PVOID pvSearch, LPCSTR pszPattern, LPCSTR pszMask)
 {
-	for (PBYTE value = (PBYTE)pBuffer; *lpMask; ++lpPattern, ++lpMask, ++value)
-	{
-		if (*lpMask == 'x' && *(LPCBYTE)lpPattern != *value)
-			return FALSE;
-	}
+    for (PBYTE value = (PBYTE)pvSearch; *pszMask; ++pszPattern, ++pszMask, ++value)
+    {
+        if (*pszMask == 'x' && *(LPCBYTE)pszPattern != *value)
+            return FALSE;
+    }
 
-	return TRUE;
+    return TRUE;
 }
 
-static __declspec(noinline) PVOID FindPatternHelper(PVOID pBase, SIZE_T dwSize, LPCSTR lpPattern, LPCSTR lpMask)
+inline DECLSPEC_NOINLINE PVOID _FindPatternHelper_1_(PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask)
 {
-	for (SIZE_T index = 0; index < dwSize; ++index)
-	{
-		PBYTE pAddress = (PBYTE)pBase + index;
+    PBYTE pBegin = (PBYTE)pvSearch;
+    PBYTE pEnd = pBegin + cbSearch;
+    for (PBYTE pIt = pBegin; pIt <= pEnd; pIt += 1)
+    {
+        if (_MaskCompareByteLevel(pIt, pszPattern, pszMask))
+            return pIt;
+    }
 
-		if (MaskCompare(pAddress, lpPattern, lpMask))
-			return pAddress;
-	}
-
-	return NULL;
+    return NULL;
 }
 
-PVOID FindPattern(PVOID pBase, SIZE_T dwSize, LPCSTR lpPattern, LPCSTR lpMask)
+inline DECLSPEC_NOINLINE PVOID _FindPatternHelper_4_(PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask)
 {
-	dwSize -= strlen(lpMask);
-	return FindPatternHelper(pBase, dwSize, lpPattern, lpMask);
+    PBYTE pBegin = (PBYTE)pvSearch;
+    PBYTE pEnd = pBegin + cbSearch;
+    for (PBYTE pIt = pBegin; pIt <= pEnd; pIt += 4)
+    {
+        if (_MaskCompareByteLevel(pIt, pszPattern, pszMask))
+            return pIt;
+    }
+
+    return NULL;
+}
+
+FORCEINLINE PVOID FindPattern(PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask)
+{
+    cbSearch -= strlen(pszMask);
+    return _FindPatternHelper_1_(pvSearch, cbSearch, pszPattern, pszMask);
+}
+
+FORCEINLINE PVOID FindPattern_4_(PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask)
+{
+    cbSearch -= strlen(pszMask);
+    return _FindPatternHelper_4_(pvSearch, cbSearch, pszPattern, pszMask);
+}
+
+FORCEINLINE BOOL _MaskCompareBitLevel(PVOID pvSearch, LPCSTR pszPattern, LPCSTR pszMask, size_t cbPattern)
+{
+    PBYTE pBegin = (PBYTE)pvSearch;
+    PBYTE pEnd = pBegin + cbPattern;
+    for (PBYTE pIt = pBegin; pIt < pEnd; ++pIt, ++pszPattern, ++pszMask)
+    {
+        if ((*pIt & *(LPCBYTE)pszMask) != *(LPCBYTE)pszPattern)
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
+inline DECLSPEC_NOINLINE PVOID _FindPatternBitMaskHelper_1_(
+    PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask, size_t cbPattern)
+{
+    PBYTE pBegin = (PBYTE)pvSearch;
+    PBYTE pEnd = pBegin + cbSearch;
+    for (PBYTE pIt = pBegin; pIt <= pEnd; pIt += 1)
+    {
+        if (_MaskCompareBitLevel(pIt, pszPattern, pszMask, cbPattern))
+            return pIt;
+    }
+
+    return NULL;
+}
+
+inline DECLSPEC_NOINLINE PVOID _FindPatternBitMaskHelper_4_(
+    PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask, size_t cbPattern)
+{
+    PBYTE pBegin = (PBYTE)pvSearch;
+    PBYTE pEnd = pBegin + cbSearch;
+    for (PBYTE pIt = pBegin; pIt <= pEnd; pIt += 4)
+    {
+        if (_MaskCompareBitLevel(pIt, pszPattern, pszMask, cbPattern))
+            return pIt;
+    }
+
+    return NULL;
+}
+
+FORCEINLINE PVOID FindPatternBitMask(
+    PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask, size_t cbPattern)
+{
+    cbSearch -= cbPattern;
+    return _FindPatternBitMaskHelper_1_(pvSearch, cbSearch, pszPattern, pszMask, cbPattern);
+}
+
+FORCEINLINE PVOID FindPatternBitMask_4_(
+    PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask, size_t cbPattern)
+{
+    cbSearch -= cbPattern;
+    return _FindPatternBitMaskHelper_4_(pvSearch, cbSearch, pszPattern, pszMask, cbPattern);
 }
 
 #if defined(_M_ARM64)
@@ -211,20 +285,34 @@ static DWORD ep_dwm_DeterminePatchAddresses(const WCHAR* pwszUDWMPath, HDPA dpaP
 
 #if defined(_M_X64)
 	// CORNER_STYLE CTopLevelWindow::GetEffectiveCornerStyle()
-	// 48 83 EC 38 0F 29 74 24 20 0F 57 F6 E8 ?? ?? ?? ?? 83 E8 02
-	//                                        ^^^^^^^^^^^
+	// Newer GetRadiusFromCornerStyle() no longer saves XMM6.
+	// Returning style 1 still selects the zero-radius (unrounded) path.
+	// 48 83 EC 28 E8 ?? ?? ?? ?? 83 E8 02 74 ?? 83 E8 01 74 ?? 83 F8 01 74 ?? 0F 57 C0
+	//             ^^^^^^^^^^^
 	// -> 48 C7 C0 01 00 00 00 C3
 	// Ref: float CTopLevelWindow::GetRadiusFromCornerStyle()
 	PBYTE match = FindPattern(
 		beginText, sizeText,
-		"\x48\x83\xEC\x38\x0F\x29\x74\x24\x20\x0F\x57\xF6\xE8\x00\x00\x00\x00\x83\xE8\x02",
-		"xxxxxxxxxxxxx????xxx"
+		"\x48\x83\xEC\x28\xE8\x00\x00\x00\x00\x83\xE8\x02\x74\x00\x83\xE8\x01\x74\x00\x83\xF8\x01\x74\x00\x0F\x57\xC0",
+		"xxxxx????xxxx?xxxx?xxxx?xxx"
 	);
 	if (match)
 	{
-		match += 12; // Point to E8
-		match += 5 + *(int*)(match + 1);
+		match += 4; // Point to E8
 	}
+	else
+	{
+		// Older GetRadiusFromCornerStyle() preserves the zero radius in XMM6.
+		match = FindPattern(
+			beginText, sizeText,
+			"\x48\x83\xEC\x38\x0F\x29\x74\x24\x20\x0F\x57\xF6\xE8\x00\x00\x00\x00\x83\xE8\x02",
+			"xxxxxxxxxxxxx????xxx"
+		);
+		if (match)
+			match += 12; // Point to E8
+	}
+	if (match)
+		match += 5 + *(int*)(match + 1);
 	if (match)
 	{
 		PatchSite* site = calloc(1, sizeof(PatchSite));
@@ -239,20 +327,38 @@ static DWORD ep_dwm_DeterminePatchAddresses(const WCHAR* pwszUDWMPath, HDPA dpaP
 	}
 #elif defined(_M_ARM64)
 	// CORNER_STYLE CTopLevelWindow::GetEffectiveCornerStyle()
-	// E8 0F 1F FC FD 7B ?? A9 FD 03 00 91 08 E4 00 2F ?? ?? ?? ?? 1F ?? 00 71
-	//                                                 ^^^^^^^^^^^
+	// Newer GetRadiusFromCornerStyle() no longer saves D8.
+	// Match the BL and the comparisons for styles 4, 3 and 2; only branch
+	// displacements vary. Style 1 takes the zero-radius path.
+	// PACIBSP; STP FP,LR; MOV FP,SP; BL getter; CMP W0,#4; B.EQ;
+	// CMP W0,#3; B.EQ; CMP W0,#2
 	// -> 20 00 80 D2 C0 03 5F D6
 	// Ref: float CTopLevelWindow::GetRadiusFromCornerStyle()
-	PBYTE match = FindPattern(
+	PBYTE match = FindPatternBitMask_4_(
 		beginText, sizeText,
-		"\xE8\x0F\x1F\xFC\xFD\x7B\x00\xA9\xFD\x03\x00\x91\x08\xE4\x00\x2F\x00\x00\x00\x00\x1F\x00\x00\x71",
-		"xxxxxx?xxxxxxxxx????x?xx"
+		"\x7F\x23\x03\xD5\xFD\x7B\xBF\xA9\xFD\x03\x00\x91\x00\x00\x00\x94\x1F\x10\x00\x71\x00\x00\x00\x54\x1F\x0C\x00\x71\x00\x00\x00\x54\x1F\x08\x00\x71",
+		"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x00\x00\x00\xFC\xFF\xFF\xFF\xFF\x1F\x00\x00\xFF\xFF\xFF\xFF\xFF\x1F\x00\x00\xFF\xFF\xFF\xFF\xFF",
+		36
 	);
 	if (match)
 	{
-		match += 16;
-		match = (PBYTE)ARM64_FollowBL((DWORD*)match);
+		match += 12; // Point to BL
 	}
+	else
+	{
+		// Older GetRadiusFromCornerStyle() keeps the zero radius in D8.
+		// Mask the STP frame size, BL displacement and first CMP immediate.
+		match = FindPatternBitMask_4_(
+			beginText, sizeText,
+			"\xE8\x0F\x1F\xFC\xFD\x7B\x80\xA9\xFD\x03\x00\x91\x08\xE4\x00\x2F\x00\x00\x00\x94\x1F\x00\x00\x71",
+			"\xFF\xFF\xFF\xFF\xFF\x7F\xC0\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x00\x00\x00\xFC\xFF\x03\xC0\xFF",
+			24
+		);
+		if (match)
+			match += 16; // Point to BL
+	}
+	if (match)
+		match = (PBYTE)ARM64_FollowBL((DWORD*)match);
 	if (match)
 	{
 		PatchSite* site = calloc(1, sizeof(PatchSite));
@@ -273,10 +379,11 @@ static DWORD ep_dwm_DeterminePatchAddresses(const WCHAR* pwszUDWMPath, HDPA dpaP
 	PBYTE cur = beginText;
 	for (int i = 0; i < 3; ++i)
 	{
-		match = FindPattern(
+		match = FindPatternBitMask_4_(
 			cur, sizeText - (cur - beginText),
-			"\x28\x6D\x40\x39\x68\x00\x00\x34\x28\x75\x40\x39\x00\x00\x00\x34\x28\x21\x40\xB9\x1F\x09\x00\x71\x00\x00\x00\x54",
-			"xxxxxxxxxxxx??xxxxxxxxxx??xx"
+			"\x28\x6D\x40\x39\x68\x00\x00\x34\x28\x75\x40\x39\x08\x00\x00\x34\x28\x21\x40\xB9\x1F\x09\x00\x71\x0A\x00\x00\x54",
+			"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x1F\x00\x00\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x1F\x00\x00\xFF",
+			28
 		);
 		if (!match)
 			break; // No more matches
@@ -284,12 +391,6 @@ static DWORD ep_dwm_DeterminePatchAddresses(const WCHAR* pwszUDWMPath, HDPA dpaP
 		cur = match + 28;
 		match += 24; // Point to B.GE
 		DWORD insnBCond = *(DWORD*)match;
-		int cond = ARM64_ReadBits(insnBCond, 3, 0);
-		if (cond != 0b1010) // GE
-		{
-			--i; // Not this one
-			continue;
-		}
 
 		int imm19 = ARM64_ReadBitsSignExtend(insnBCond, 23, 5);
 		DWORD newInsn = ARM64_MakeB(imm19);
